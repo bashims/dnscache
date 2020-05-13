@@ -5,6 +5,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 func TestResolver_LookupHost(t *testing.T) {
@@ -51,6 +53,51 @@ func TestClearCache(t *testing.T) {
 	r.Refresh(true)
 	if e := r.cache["hgoogle.com"]; e != nil {
 		t.Error("cache entry is not cleared")
+	}
+}
+
+// TODO clean up this test.
+func TestRefreshWithCallback(t *testing.T) {
+	callCount := 0
+	host := "google.com"
+
+	expectedResult := &RefreshResult{
+		Changed: false,
+	}
+	r := &Resolver{
+		RefreshCallBack: func(actual *RefreshResult) {
+			callCount++
+			if diff := cmp.Diff(expectedResult, actual); diff != "" {
+				t.Errorf("RefreshResult mismatch (-want +got):\n%s", diff)
+			}
+		},
+	}
+
+	_, err := r.LookupHost(context.Background(), host)
+	if err != nil {
+		t.Errorf("LookupHost() unexpected error = %q", err)
+		return
+	}
+
+	r.RefreshWithCallback(true)
+	if callCount != 1 {
+		t.Errorf("RefreshCallBack() expectedResult %d calls, got %d", 1, callCount)
+	}
+
+	cur := r.cache["h"+host]
+	if cur == nil {
+		t.Errorf("Unexpected error, cache missing expectedResult entry %s", host)
+		return
+	}
+	cur.rrs = []string{}
+	cur.used = true
+
+	expectedResult = &RefreshResult{
+		Changed: true,
+	}
+	r.RefreshWithCallback(false)
+	if callCount != 2 {
+		t.Errorf("RefreshCallBack() expectedResult %d calls, got %d", 1, callCount)
 	}
 }
 

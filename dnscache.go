@@ -3,6 +3,8 @@ package dnscache
 import (
 	"context"
 	"net"
+	"reflect"
+	"sort"
 	"sync"
 	"time"
 
@@ -14,6 +16,11 @@ type DNSResolver interface {
 	LookupAddr(ctx context.Context, addr string) (names []string, err error)
 }
 
+type RefreshResult struct {
+	// Changed is true when the refresh operation changed the cache contents since the last refresh.
+	Changed bool
+}
+
 type Resolver struct {
 	// Timeout defines the maximum allowed time allowed for a lookup.
 	Timeout time.Duration
@@ -22,13 +29,16 @@ type Resolver struct {
 	// net.DefaultResolver is used instead.
 	Resolver DNSResolver
 
-	once  sync.Once
-	mu    sync.RWMutex
-	cache map[string]*cacheEntry
+	once    sync.Once
+	mu      sync.RWMutex
+	cache   map[string]*cacheEntry
 
 	// OnCacheMiss is executed if the host or address is not included in
 	// the cache and the default lookup is executed.
 	OnCacheMiss func()
+
+	// RefreshWithCallback are executed when the cache is refreshed.
+	RefreshCallBack func(result *RefreshResult)
 }
 
 type cacheEntry struct {
@@ -55,8 +65,24 @@ func (r *Resolver) LookupHost(ctx context.Context, host string) (addrs []string,
 // last Refresh. If clearUnused is true, entries which hasn't be used since the
 // last Refresh are removed from the cache.
 func (r *Resolver) Refresh(clearUnused bool) {
+	r.refresh(clearUnused, false)
+}
+
+// Refresh refreshes cached entries which has been used at least once since the
+// last Refresh. If clearUnused is true, entries which hasn't be used since the
+// last Refresh are removed from the cache.
+func (r *Resolver) RefreshWithCallback(clearUnused bool) {
+	if r.RefreshCallBack == nil {
+		panic("refresh callback not set")
+	}
+	r.refresh(clearUnused, true)
+}
+
+func (r *Resolver) refresh(clearUnused, withCallback bool) {
 	r.once.Do(r.init)
 	r.mu.RLock()
+
+	result := &RefreshResult{}
 	update := make([]string, 0, len(r.cache))
 	del := make([]string, 0, len(r.cache))
 	for key, entry := range r.cache {
@@ -64,6 +90,7 @@ func (r *Resolver) Refresh(clearUnused bool) {
 			update = append(update, key)
 		} else if clearUnused {
 			del = append(del, key)
+			result.Changed = true
 		}
 	}
 	r.mu.RUnlock()
@@ -77,7 +104,17 @@ func (r *Resolver) Refresh(clearUnused bool) {
 	}
 
 	for _, key := range update {
-		r.update(context.Background(), key, false)
+		last := r.cache[key].rrs
+		rrs, _ := r.update(context.Background(), key, false)
+		if withCallback && !result.Changed {
+			sort.Strings(last)
+			sort.Strings(rrs)
+			result.Changed = !reflect.DeepEqual(last, rrs)
+		}
+	}
+
+	if withCallback {
+		r.RefreshCallBack(result)
 	}
 }
 
@@ -114,7 +151,7 @@ func (r *Resolver) update(ctx context.Context, key string, used bool) (rrs []str
 		}
 	case res := <-c:
 		if res.Shared {
-			// We had concurrent lookups, check if the cache is already updated
+			// We had concurrent lookups, check if the cache is already changed
 			// by a friend.
 			var found bool
 			rrs, err, found = r.load(key)
